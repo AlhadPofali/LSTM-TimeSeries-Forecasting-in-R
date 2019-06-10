@@ -1,0 +1,5 @@
+Part 2 - LSTM for time series Forecasting
+
+There are various methods available for time series forecasting. Lately with advent of ML, Neural Networks with Deep Learning and LSTM are gaining ground. Particularly, as compared to Recurrent Neural Networks, we find LSTM have better ability to carry out forecasting task. This exercise is in continuation of Time Series - EDA, Clustering and Forecasting approach. In this we model and evaluate the fitment of LSTM model. This exercise is also for how list steps and parameters required to implement LSTM to a time series.
+
+To provide a context to this post, we will use LSTM to forecast for cash deposit data at their various branches. There are 128 branches in total with day level data and approximately 1.5 years of history.
