@@ -1,0 +1,392 @@
+---
+title: "LSTM time series forecasting for multiple branches(small bank)"
+author: Alhad Pofali
+output:
+  html_document:
+    number_sections: false
+    toc: true
+    fig_width: 8
+    fig_height: 6
+    theme: cosmo
+    highlight: tango
+    code_folding: show
+---
+
+```{r setup,  message=FALSE, warning=FALSE}
+# Core Tidyverse
+library(tidyverse)
+library(glue)
+library(forcats)
+
+# Time Series
+library(timetk)
+library(tidyquant)
+library(tibbletime)
+
+# Visualization
+library(cowplot)
+
+# Preprocessing
+library(recipes)
+
+# Sampling / Accuracy
+library(rsample)
+library(yardstick) 
+
+# Modeling
+library(keras)
+library(ggplot2)
+library(forecast)
+```
+
+*Part 2 - LSTM for time series Forecasting*
+
+There are various methods available for time series forecasting. Lately with advent of ML, Neural Networks with Deep Learning and LSTM are gaining ground. Particularly, as compared to Recurrent Neural Networks, we find LSTM have better ability to carry out forecasting task. This exercise is in continuation of Time Series - EDA, Clustering and Forecasting approach. In this we model and evaluate the fitment of LSTM model. This exercise is also for how list steps and parameters required to implement LSTM to a time series.
+
+To provide a context to this post, we will use LSTM to forecast for cash deposit data at their various branches. There are 128 branches in total with day level data and approximately 1.5 years of history.
+
+
+
+```{r input_file,  message=FALSE, warning=FALSE}
+# Load raw data
+all_NB <- read.csv("/users/saurabhsawant/NON_BULK.txt", header=TRUE, 
+                   sep="\t", col.names=c("SOLID", "TRAN_START_DATE", "TYPE_OF_ACCT","SEGMENT","COUNT_ACCTS", "CASH_WITHDRAWAL_CNT", "CASH_DEPOSIT_CNT", "CASH_WITHDRAWAL_AMT", "CASH_DEPOSIT_AMT"))
+
+#Modify date to YMD
+all_NB$date <- as.Date(all_NB$TRAN_START_DATE, format = "%Y-%m-%d")
+
+
+#Aggregate data by branches
+all_NB %>% group_by(SOLID, date) %>% 
+  summarise(CWC = sum(CASH_WITHDRAWAL_CNT), CDC=sum(CASH_DEPOSIT_CNT), CWA = sum(CASH_WITHDRAWAL_AMT), CDA = sum(CASH_DEPOSIT_AMT)) %>% 
+  ungroup() -> all_NB_SOL
+
+all_NB_SOL <- filter(all_NB_SOL, all_NB_SOL$date <= '2012-08-31') # Remove noisy data post this date. 15 days data points lost
+
+head(all_NB_SOL)
+```
+
+**Data Prepration**  
+
+Once we load the data, few activities have been done in above code. Transform the dates into the date format as upload file has text format. Basic data has few more characteristics of Account type and segment in addition to the branch ids. However, as evaluated in earlier post of EDA and clustering, the data becomes very sparse at the segment level except for few. Hence we aggregate the data at branch id.
+
+Also, there is unusual deviations and in deposits for last couple of days and hence that data is ignored.
+
+
+
+```{r remove outliers, message=FALSE, warning=FALSE}
+#To remove outliers (for both deposit and withdrawa;s)
+#function - to remove outliers for cash deposit counts
+rem_out <- function(ID) {
+  p <- filter(all_NB_SOL, all_NB_SOL$SOLID == as.integer(ID))
+  q <- subset(p,!(p$CDA > quantile(p$CDA, probs=c(.02, .98))[2] | p$CDA < quantile(p$CDA, probs=c(.02, .98))[1]) )
+  r <- subset(q,!(q$CWA > quantile(q$CWA, probs=c(.02, .98))[2] | q$CWA < quantile(q$CWA, probs=c(.02, .98))[1]) )
+  r
+}
+
+#data frame to store the data
+all_NB_SOL_out<- as.vector(0)
+
+#Loop to store the data after outlier corrections
+for (i in unique(all_NB_SOL$SOLID)) {
+  x <-rem_out(i)
+  all_NB_SOL_out <- if (all_NB_SOL_out == 0) x else rbind(all_NB_SOL_out,x)
+}
+
+head(all_NB_SOL_out)
+tail(all_NB_SOL_out)
+```
+
+In data preparation, we remove the salient outliers i.e. points outside of 0.2 - 0.98 quantile range. This significantly reduces large fluctuations seen. We create a simple function and loop it across the branches so that limits are evaluated at each branch level.
+
+
+```{r standardize time length , message=FALSE, warning=FALSE}
+#function - to fill in missing dates with 0 values to complete the matrix
+test_fun_CA <- function(ID) {
+  q <- filter(all_NB_SOL_out, all_NB_SOL_out$SOLID == as.integer(ID))
+  q %>% complete(date = seq.Date(as.Date("2010-10-01"), as.Date("2012-08-31"), by="day")) -> q
+  q$SOLID[is.na(q$SOLID)] <- as.character(ID)
+  q[is.na(q)] <- 0
+  q
+}
+#Create data with use of function for to fill missing dates with 0
+m <- as.vector(0)
+for (i in unique(all_NB_SOL_out$SOLID)) {
+  x <-test_fun_CA(i)
+  m <- if (m == 0) x else rbind(m,x)
+}
+
+m[1:15,]
+```
+
+Base data contains entries only for working days and missing days are not available. For sake of completeness, the data is spread across maximum available dates as per the data. This introduces entries with 0 in rows. This is done using function and loop.
+
+
+```{r subset data, message=FALSE, warning=FALSE}
+#get only required columns from outlier + expanded data
+m <- subset(m, select = c("SOLID", "date", "CDA"))
+
+colnames(m) <- c("SOLID", "index", "value")
+
+#compute moving average for the weekends and holidays for complete data set and use moving average to fill #it
+t<-0 # to store moving 
+for (i in unique(m$SOLID)) {
+  q <-filter(m, m$SOLID == as.integer(i))
+  q$ma7 <- as.integer(ma(q$value, order=7))
+  for (i in 1:nrow(q)) {
+    q$value[i] <- if(q$value[i] == 0) q$value[i]<-q$ma7[i] else q$value[i]
+  }
+  t <- if (t == 0) q else rbind(t,q)
+}
+
+t <- subset(t, select = c("SOLID", "index", "value")) # ignore ma7 column
+
+t<-t[!is.na(t$value),] #remove NAs from the table i.e. first 3 values for each start period
+
+t[1:15,]
+```
+
+However, with the range of values on higher side, 0s create lot of fluctuations and would hamper output. Hence strategy used here is to interpolate these values with the moving average of 7 days. NAs are also removed which would be inserted due to first 3 values.
+
+
+
+```{r function, message=FALSE, warning=FALSE, echo=FALSE }
+# Create time_bind_rows() to solve dplyr issue
+time_bind_rows <- function(data_1, data_2, index) {
+  index_expr <- enquo(index)
+  bind_rows(data_1, data_2) %>%
+    as_tbl_time(index = !! index_expr)
+}
+
+```
+
+**Model Defination**  
+
+
+```{r declare model, message=FALSE, warning=FALSE}
+# Model inputs
+lag_setting  <- 7 # This is used to create a y for model to match. Here it is 7/28 to map a weekly behaviour. we can take 30 too but exact lag of month is difficult and this also reduces the quantity of data for model.
+batch_size   <- 10 # number of elements used before weights are updated.
+#train_length <- 400
+tsteps       <- 3
+epochs       <- 200 # number of repetations done on data to improve accuracy
+
+model <- keras_model_sequential()
+
+model %>%
+  layer_lstm(units            = 100, 
+             input_shape      = c(tsteps, 1), 
+             batch_size       = batch_size,
+             return_sequences = TRUE,
+             stateful         = TRUE) %>% 
+  layer_lstm(units            = 100, 
+             return_sequences = TRUE, 
+             stateful         = TRUE) %>%
+  layer_lstm(units            = 50, 
+             return_sequences = FALSE, 
+             stateful         = TRUE) %>% 
+  layer_dense(units = 1)
+
+model %>% 
+  compile(loss = 'mae', optimizer = 'adam')
+
+model
+```
+Parameters of LSTM Model ( This section would be updated continiously)
+
+Parameters of LSTM Model ( This section would be updated continuously)  
+
+lag_setting -> This is used to create a y for model to match. Here we change it to 7/14/28 to map a weekly behaviour. We can take 30 too but exact lag of month is difficult and this also reduces the quantity of data for model.  
+
+LSTM input shape is (batch_size, timesteps, input_dim) input dimension is the number of time series fed, here it is only one…   
+How many layers are there in this model? 3 layers.  
+What are time steps? Time steps are the number of data points taken in consideration to arrive at y.   
+What are the dimensions on first layer? (batch size X timesteps X units i.e. 10, 1, 200)  Carry out iterations on this to see how model fits data What is return sequence?   
+Return sequence is the ability to provide a feedback to previous layers which inturn provides memory to model  
+
+Note on model:  
+-	4 interacting layers in each LSTM module  
+-	Long line across the module is module state Beta gates decides the degree of update to module state between 0 and 1 (including 0 and 1)  
+-	LSTMs can have multidimensional timseries inputs. Here we have only one time series i.e deposit amount. If we also consider deposit count then it will also add to the model and input_dim value would be 2.  
+-	Neural networks don’t work well without normalized data.  
+
+
+**Function - LSTM**
+
+```{r create LSTM function, message=FALSE, warning=FALSE}
+
+#ID is the branch id input to function. A loop would be created to input different IDs
+LSTM_Model <- function(ID) {
+  
+  t_temp <- filter(t, t$SOLID == as.integer(ID)) #get data from original table
+  t_temp <- subset(t_temp, select = c("index", "value")) # select only columns
+  outliers <- boxplot(t_temp$value, plot = FALSE)$out # identify  outliers from CDA
+  t_temp <-if (is_empty(outliers) == TRUE) t_temp else t_temp[-which(t_temp$value %in% outliers),] # remove the data points 
+  t_temp<-t_temp[!(t_temp$value == 0),] #remove all the zeros
+  t_temp <- t_temp[1:(round(floor(nrow(t_temp)/batch_size))*batch_size),] # select rows from complete data set rounded to batch size for division of rows later in code
+  
+  if (nrow(t_temp) > 150) {
+    #train and test split
+    df_trn <- t_temp[1:(nrow(t_temp)-100),] # select n - 100 rows as training set
+    df_tst <- t_temp[(nrow(t_temp)-99):nrow(t_temp),] # select remaining rows as test set
+    #Combine data into one data frame with key as training and testing data
+    df <- bind_rows(
+      df_trn %>% add_column(key = "training"),
+      df_tst %>% add_column(key = "testing")
+    ) %>% 
+      as_tbl_time(index = index)
+  # find values for normalizing recipe and bake
+    rec_obj <- recipe(value ~ ., df) %>%
+      step_sqrt(value) %>%
+      step_center(value) %>%
+      step_scale(value) %>%
+      prep()
+    df_processed_tbl <- bake(rec_obj, df)
+    
+    center_history <- rec_obj$steps[[2]]$means["value"]
+    scale_history  <- rec_obj$steps[[3]]$sds["value"]
+    c("center" = center_history, "scale" = scale_history)
+    
+    # Training Set
+    
+    train_length <- round((floor((nrow(df_trn) - lag_setting)/batch_size))*batch_size) # Lag is introduced to make a Y vector for comparing. After introducing lag, the remaining number of rows should be divisible by the batch size.
+    #select lag table 
+    lag_train_tbl <- df_processed_tbl %>%
+      mutate(value_lag = lag(value, n = lag_setting)) %>%
+      filter(!is.na(value_lag)) %>%
+      filter(key == "training") %>%
+      tail(train_length)
+    
+    x_train_vec <- lag_train_tbl$value_lag # select only the values from table as vector
+    x_train_arr <- array(data = x_train_vec, dim = c(length(x_train_vec), 3, 1)) #create input dimension with (nrows, batchsize, ndimensions)
+    y_train_vec <- lag_train_tbl$value 
+    y_train_arr <- array(data = y_train_vec, dim = c(length(y_train_vec), 1))
+    
+    # Testing Set
+    lag_test_tbl <- df_processed_tbl %>%
+      mutate(
+        value_lag = lag(value, n = lag_setting)
+      ) %>%
+      filter(!is.na(value_lag)) %>%
+      filter(key == "testing")
+    
+      x_test_vec <- lag_test_tbl$value_lag
+      x_test_arr <- array(data = x_test_vec, dim = c(length(x_test_vec), 3, 1)) # same as that of the train set
+      y_test_vec <- lag_test_tbl$value
+      y_test_arr <- array(data = y_test_vec, dim = c(length(y_test_vec), 1))
+      
+      #fit model for the number of epochs
+      for (i in 1:epochs) {
+        
+        model %>% fit(x          = x_train_arr,
+                      y          = y_train_arr, 
+                      batch_size = batch_size,
+                      epochs     = 1,
+                      verbose    = 1, 
+                      shuffle    = FALSE)
+        model %>% reset_states()
+        cat("Epoch: ", i)
+
+        
+        
+      }
+      
+      # Make Predictions
+      pred_out <- model %>% 
+        predict(x_test_arr, batch_size = batch_size) %>%
+        .[,1] 
+      
+        # Retransform values
+      pred_tbl <- tibble(
+        index   = lag_test_tbl$index,
+        value   = (pred_out * scale_history + center_history)^2
+      )
+      
+        # Combine actual data with predictions
+      
+      tbl_1 <- df_trn %>%
+        add_column(key = "actual")
+      tbl_2 <- df_tst %>%
+        add_column(key = "actual")
+      tbl_3 <- pred_tbl %>%
+        add_column(key = "predict")
+      
+      ret <- list(tbl_1, tbl_2, tbl_3) %>%
+        reduce(time_bind_rows, index = index) %>%
+        arrange(key, index) %>%
+        mutate(key = as_factor(key))
+      
+  } else {
+    print(paste0(i, " Branch number has less than 150 historical number of records"))
+    ret <- 0
+  }
+  return(ret)
+}
+```
+
+
+Above is LSTM function for training and testing model. Function has following logic flow:
+
+1.Filter data for an selected branch. Select only columns of index and value i.e. date and deposit amount.  
+2.Check for outliers again as there might be few residual spikes.  
+3.Remove outliers from data.   
+4.Round down the number of data points to multiple of batch size for easy division of data as LSTM has strict requirement on dimensions.  
+5.Check if the number of data points are more than 150 (if less, then ignore the branch as the number of training and test records are less).   
+6.Reserve 100 data points for testing and use rest for training.   
+7.Create a data frame with both, training and testing, label each data point accordingly.   
+8.Normalize data and capture the mean and variance to add later to output data.   
+9.Lag setting introduces few redundancies as data is being considered from first date in the data. Hence number of training samples also need to be adjusted based on lag setting so that data is equally divisible by the batch size.   
+10.Vectorize the data for train and test and create dimensions for input to LSTM.   
+11.Use model created to use it to fit to data.   
+12.Predict it on the test data.   
+13.Transform data to original scale using centre value and distribution.   
+14.Use same dates as the test data and store predicted value in the “ret” table.   
+15.This table is the return value of function.
+
+
+
+
+```{r LSTM on branches, message=FALSE, warning=FALSE, results="hide"}
+
+
+ret_all <- as.vector(0) # empty arrary for storing all the results
+ret_b <- as.vector(0) 
+
+for (i in unique(m$SOLID)[1:5]) { # for loop across all the branches
+  ret <-LSTM_Model(i) # call function and it returns a vector
+  if (ret_all == 0) { # ret is output of the function. if some branches have very less data then ignore the branche and move ahead
+    if(ret == 0) {
+      
+    }else {
+      ret_b <- rep(i, nrow(ret))
+      ret_all <- cbind(ret_b, ret)
+    }
+    
+  } else {
+    if (ret == 0) {# ret is output of the function. if some branches have very less data then ignore the branche and move ahead
+      
+    } else {
+      ret_b <- rep(i, nrow(ret))
+      ret_b <- cbind(ret_b, ret)
+      ret_all <- rbind(ret_all, ret_b)
+    }
+  }
+}
+
+
+```
+
+Loop over sample branches to create a consolidated table. When there are many branches, a single model will not work. If we refer to earlier exercise of clustering, a model at can at best be optimized for a cluster which have common characteristics.
+
+
+**Plots with forecast**
+```{r plot, message=FALSE, warning=FALSE }
+ggplot(ret_all, aes(index, value, color = key)) + geom_line(size = 0.2) + stat_smooth(method = "loess") + 
+  facet_wrap(~ret_b, scales = "free")
+
+```
+
+Above are few sample plots. Green colour is the predicted values. However, in current output we see that model is sensitive to variations and is amplifying same. Optimization can be achieved by parameter tuning.
+
+I will continue same in the next post....
+
